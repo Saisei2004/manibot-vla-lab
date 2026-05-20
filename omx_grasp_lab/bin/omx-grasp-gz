@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+set -e
+source /opt/ros/jazzy/setup.bash
+export DISPLAY="${DISPLAY:-:0}"
+export PATH="$HOME/.local/bin:$PATH"
+
+stop_stale_gazebo() {
+  pkill -TERM -f "open_manipulator_x_gazebo.launch.py" 2>/dev/null || true
+  pkill -TERM -f "mobile_open_manipulator_gz.launch.py" 2>/dev/null || true
+  pkill -TERM -f "omx-mobile-grasp-gz" 2>/dev/null || true
+  pkill -TERM -f "gz sim" 2>/dev/null || true
+  pkill -TERM -f "parameter_bridge" 2>/dev/null || true
+  sleep 1
+  pkill -KILL -f "open_manipulator_x_gazebo.launch.py" 2>/dev/null || true
+  pkill -KILL -f "mobile_open_manipulator_gz.launch.py" 2>/dev/null || true
+  pkill -KILL -f "omx-mobile-grasp-gz" 2>/dev/null || true
+  pkill -KILL -f "gz sim" 2>/dev/null || true
+  pkill -KILL -f "parameter_bridge" 2>/dev/null || true
+}
+
+stop_stale_gazebo
+omx-randomize-object
+ros2 launch open_manipulator_bringup open_manipulator_x_gazebo.launch.py world:="$HOME/robot_ws/worlds/omx_grasp_lab"

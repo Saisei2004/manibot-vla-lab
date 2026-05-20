@@ -1,0 +1,9 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=Open Gripper
+Comment=Open the OpenMANIPULATOR X gripper
+Icon=go-up
+Terminal=false
+Exec=xfce4-terminal --title="Open Gripper" --hold --command="bash -lc 'export PATH=$HOME/.local/bin:$PATH; source /opt/ros/jazzy/setup.bash; omx-open'"
+Categories=Development;Robotics;

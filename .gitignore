@@ -1,0 +1,35 @@
+# macOS
+.DS_Store
+
+# Local VM access
+.ssh-vm/
+*.pem
+*_key
+*_key.pub
+
+# Large installers / images
+*.iso
+*.dmg
+SHA256SUMS
+
+# Xcode generated output
+.xcode-derived/
+.xcode-derived-iphone-teleop/
+DerivedData/
+build/
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+
+# ROS / colcon generated output
+log/
+install/
+build/
+
+# Local scratch grasp experiments
+ogone
+ogtest

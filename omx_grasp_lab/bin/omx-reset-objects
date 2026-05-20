@@ -1,0 +1,69 @@
+#!/usr/bin/env python3
+import json
+import math
+import random
+import subprocess
+from pathlib import Path
+
+WORLD_NAME = "omx_grasp_lab"
+TARGET_FILE = Path.home() / ".ros/omx_grasp_target.json"
+
+OBJECTS = {
+    "grasp_small": {"z": 0.0225, "radius": 0.032},
+    "grasp_medium": {"z": 0.0275, "radius": 0.036},
+    "grasp_large": {"z": 0.0400, "radius": 0.052},
+}
+
+
+def run(command):
+    return subprocess.run(
+        ["bash", "-lc", f"source /opt/ros/jazzy/setup.bash; {command}"],
+        check=False,
+    )
+
+
+def gz_set_pose(name, x, y, z, yaw):
+    half = yaw * 0.5
+    request = (
+        f'name: "{name}" '
+        f'position {{ x: {x:.5f} y: {y:.5f} z: {z:.5f} }} '
+        f'orientation {{ x: 0 y: 0 z: {math.sin(half):.7f} w: {math.cos(half):.7f} }}'
+    )
+    command = (
+        f"gz service -s /world/{WORLD_NAME}/set_pose "
+        "--reqtype gz.msgs.Pose --reptype gz.msgs.Boolean --timeout 2000 "
+        f"--req '{request}'"
+    )
+    result = run(command)
+    if result.returncode != 0:
+        raise RuntimeError(f"failed to set pose for {name}; is Gazebo running?")
+
+
+def random_front_pose(placed, radius):
+    for _ in range(250):
+        x = random.uniform(0.155, 0.315)
+        y = random.uniform(-0.125, 0.125)
+        if all(((x - px) ** 2 + (y - py) ** 2) ** 0.5 > radius + pr + 0.025 for px, py, pr in placed):
+            return x, y
+    return random.uniform(0.18, 0.29), random.uniform(-0.10, 0.10)
+
+
+def main():
+    placed = []
+    chosen_target = None
+    for name, spec in OBJECTS.items():
+        x, y = random_front_pose(placed, spec["radius"])
+        yaw = random.uniform(-0.35, 0.35)
+        placed.append((x, y, spec["radius"]))
+        gz_set_pose(name, x, y, spec["z"], yaw)
+        print(f"{name}: x={x:.3f} y={y:.3f} z={spec['z']:.3f}", flush=True)
+        if name == "grasp_medium":
+            chosen_target = {"name": name, "x": x, "y": y, "z": spec["z"], "yaw": yaw}
+
+    TARGET_FILE.parent.mkdir(parents=True, exist_ok=True)
+    TARGET_FILE.write_text(json.dumps(chosen_target, indent=2) + "\n")
+    print(f"target reset: {chosen_target['name']} x={chosen_target['x']:.3f} y={chosen_target['y']:.3f}", flush=True)
+
+
+if __name__ == "__main__":
+    main()

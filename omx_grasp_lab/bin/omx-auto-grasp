@@ -1,0 +1,37 @@
+#!/usr/bin/env bash
+set -e
+source /opt/ros/jazzy/setup.bash
+
+send_arm() {
+  local p1="$1" p2="$2" p3="$3" p4="$4" sec="${5:-3}"
+  ros2 action send_goal /arm_controller/follow_joint_trajectory control_msgs/action/FollowJointTrajectory \
+    "{trajectory: {joint_names: [joint1, joint2, joint3, joint4], points: [{positions: [$p1, $p2, $p3, $p4], time_from_start: {sec: $sec, nanosec: 0}}]}}"
+}
+
+send_gripper() {
+  local pos="$1" effort="${2:-20.0}"
+  ros2 action send_goal /gripper_controller/gripper_cmd control_msgs/action/GripperCommand \
+    "{command: {position: $pos, max_effort: $effort}}"
+}
+
+echo "[1/6] open gripper"
+send_gripper 0.019 10.0
+sleep 1
+
+echo "[2/6] move above block"
+send_arm 0.0 -0.16 0.66 -0.50 3
+sleep 3
+
+echo "[3/6] descend around block"
+send_arm 0.0 0.11 0.82 -0.93 3
+sleep 3
+
+echo "[4/6] close gripper"
+send_gripper -0.010 80.0
+sleep 2
+
+echo "[5/6] lift"
+send_arm 0.0 -0.27 0.19 0.09 3
+sleep 3
+
+echo "[6/6] hold complete"

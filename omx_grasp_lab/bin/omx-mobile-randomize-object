@@ -1,0 +1,54 @@
+#!/usr/bin/env python3
+import json
+import math
+import random
+import xml.etree.ElementTree as ET
+from pathlib import Path
+
+home = Path.home()
+world_path = home / "robot_ws/worlds/omx_mobile_grasp_lab.sdf"
+target_path = home / ".ros/omx_mobile_grasp_target.json"
+
+rng = random.Random()
+radius = rng.uniform(0.85, 2.15)
+theta = rng.uniform(-math.pi, math.pi)
+x = radius * math.cos(theta)
+y = radius * math.sin(theta)
+yaw = rng.uniform(-math.pi, math.pi)
+z = 0.035
+
+tree = ET.parse(world_path)
+root = tree.getroot()
+
+cube = None
+for model in root.findall(".//model"):
+    if model.attrib.get("name") == "grasp_cube":
+        cube = model
+        break
+
+if cube is None:
+    raise SystemExit("grasp_cube not found in mobile world")
+
+pose = cube.find("pose")
+if pose is None:
+    pose = ET.SubElement(cube, "pose")
+pose.text = f"{x:.5f} {y:.5f} {z:.5f} 0 0 {yaw:.5f}"
+
+tree.write(world_path, encoding="utf-8", xml_declaration=True)
+
+target_path.parent.mkdir(parents=True, exist_ok=True)
+target = {
+    "x": x,
+    "y": y,
+    "z": z,
+    "yaw": yaw,
+    "radius": radius,
+    "theta": theta,
+}
+target_path.write_text(json.dumps(target, indent=2) + "\n")
+
+print(
+    "mobile target "
+    f"r={radius:.3f} theta={theta:.2f} x={x:.3f} y={y:.3f} z={z:.3f} yaw={yaw:.2f}"
+)
+print(f"saved {target_path}")

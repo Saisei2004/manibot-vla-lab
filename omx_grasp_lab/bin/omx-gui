@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+set -e
+source /opt/ros/jazzy/setup.bash
+ros2 launch open_manipulator_gui open_manipulator_x_gui.launch.py

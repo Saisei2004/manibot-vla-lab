@@ -1,0 +1,149 @@
+<?xml version="1.0" ?>
+<sdf version="1.10">
+  <world name="omx_grasp_lab">
+    <physics name="1ms" type="ignored">
+      <max_step_size>0.002</max_step_size>
+      <real_time_factor>1.0</real_time_factor>
+    </physics>
+
+    <plugin filename="gz-sim-physics-system" name="gz::sim::systems::Physics"/>
+    <plugin filename="gz-sim-user-commands-system" name="gz::sim::systems::UserCommands"/>
+    <plugin filename="gz-sim-scene-broadcaster-system" name="gz::sim::systems::SceneBroadcaster"/>
+    <plugin filename="gz-sim-contact-system" name="gz::sim::systems::Contact"/>
+
+    <scene>
+      <ambient>0.46 0.46 0.46 1</ambient>
+      <background>0.70 0.78 0.86 1</background>
+      <grid>true</grid>
+    </scene>
+
+    <gui fullscreen="0">
+      <plugin name="3D View" filename="GzScene3D">
+        <gz-gui>
+          <title>3D View</title>
+          <property type="bool" key="showTitleBar">0</property>
+          <property type="string" key="state">docked</property>
+        </gz-gui>
+        <engine>ogre2</engine>
+        <scene>scene</scene>
+        <ambient_light>0.46 0.46 0.46</ambient_light>
+        <background_color>0.70 0.78 0.86</background_color>
+        <camera_pose>-0.42 -0.50 0.38 0 0.56 0.78</camera_pose>
+      </plugin>
+    </gui>
+
+    <light name="sun" type="directional">
+      <cast_shadows>true</cast_shadows>
+      <pose>0 0 3 0 0 0</pose>
+      <diffuse>0.85 0.85 0.85 1</diffuse>
+      <specular>0.2 0.2 0.2 1</specular>
+      <direction>-0.4 0.2 -1</direction>
+    </light>
+
+    <model name="ground_plane">
+      <static>true</static>
+      <link name="link">
+        <collision name="collision">
+          <geometry><plane><normal>0 0 1</normal><size>2 2</size></plane></geometry>
+        </collision>
+        <visual name="visual">
+          <geometry><plane><normal>0 0 1</normal><size>2 2</size></plane></geometry>
+          <material><diffuse>0.78 0.78 0.74 1</diffuse></material>
+        </visual>
+      </link>
+    </model>
+
+    <model name="workspace_tray">
+      <static>true</static>
+      <pose>0 0 0 0 0 0</pose>
+      <link name="link">
+        <collision name="back_wall_collision">
+          <pose>0.245 0.175 0.0175 0 0 0</pose>
+          <geometry><box><size>0.310 0.012 0.035</size></box></geometry>
+        </collision>
+        <visual name="back_wall_visual">
+          <pose>0.245 0.175 0.0175 0 0 0</pose>
+          <geometry><box><size>0.310 0.012 0.035</size></box></geometry>
+          <material><diffuse>0.20 0.22 0.24 0.82</diffuse></material>
+        </visual>
+        <collision name="side_wall_collision">
+          <pose>0.245 -0.175 0.0175 0 0 0</pose>
+          <geometry><box><size>0.310 0.012 0.035</size></box></geometry>
+        </collision>
+        <visual name="side_wall_visual">
+          <pose>0.245 -0.175 0.0175 0 0 0</pose>
+          <geometry><box><size>0.310 0.012 0.035</size></box></geometry>
+          <material><diffuse>0.20 0.22 0.24 0.82</diffuse></material>
+        </visual>
+        <collision name="right_wall_collision">
+          <pose>0.400 0 0.0175 0 0 0</pose>
+          <geometry><box><size>0.012 0.350 0.035</size></box></geometry>
+        </collision>
+        <visual name="right_wall_visual">
+          <pose>0.400 0 0.0175 0 0 0</pose>
+          <geometry><box><size>0.012 0.350 0.035</size></box></geometry>
+          <material><diffuse>0.20 0.22 0.24 0.82</diffuse></material>
+        </visual>
+      </link>
+    </model>
+
+    <model name="reset_button_marker">
+      <static>true</static>
+      <pose>0.365 -0.135 0.010 0 0 0</pose>
+      <link name="link">
+        <visual name="visual">
+          <geometry><cylinder><radius>0.024</radius><length>0.020</length></cylinder></geometry>
+          <material><diffuse>0.95 0.05 0.04 1</diffuse></material>
+        </visual>
+      </link>
+    </model>
+
+    <model name="grasp_small">
+      <static>false</static>
+      <pose>0.20 -0.09 0.0225 0 0 0</pose>
+      <link name="link">
+        <inertial><mass>0.025</mass><inertia><ixx>0.00001</ixx><iyy>0.00001</iyy><izz>0.00001</izz></inertia></inertial>
+        <collision name="collision">
+          <geometry><box><size>0.040 0.040 0.045</size></box></geometry>
+          <surface><friction><ode><mu>1.8</mu><mu2>1.8</mu2></ode></friction></surface>
+        </collision>
+        <visual name="visual">
+          <geometry><box><size>0.040 0.040 0.045</size></box></geometry>
+          <material><diffuse>0.9 0.18 0.12 1</diffuse></material>
+        </visual>
+      </link>
+    </model>
+
+    <model name="grasp_medium">
+      <static>false</static>
+      <pose>0.24 0.00 0.0275 0 0 0</pose>
+      <link name="link">
+        <inertial><mass>0.040</mass><inertia><ixx>0.00002</ixx><iyy>0.00002</iyy><izz>0.00002</izz></inertia></inertial>
+        <collision name="collision">
+          <geometry><box><size>0.045 0.045 0.055</size></box></geometry>
+          <surface><friction><ode><mu>1.8</mu><mu2>1.8</mu2></ode></friction></surface>
+        </collision>
+        <visual name="visual">
+          <geometry><box><size>0.045 0.045 0.055</size></box></geometry>
+          <material><diffuse>0.12 0.48 0.90 1</diffuse></material>
+        </visual>
+      </link>
+    </model>
+
+    <model name="grasp_large">
+      <static>false</static>
+      <pose>0.28 0.10 0.040 0 0 0</pose>
+      <link name="link">
+        <inertial><mass>0.060</mass><inertia><ixx>0.00004</ixx><iyy>0.00004</iyy><izz>0.00004</izz></inertia></inertial>
+        <collision name="collision">
+          <geometry><box><size>0.070 0.070 0.080</size></box></geometry>
+          <surface><friction><ode><mu>1.8</mu><mu2>1.8</mu2></ode></friction></surface>
+        </collision>
+        <visual name="visual">
+          <geometry><box><size>0.070 0.070 0.080</size></box></geometry>
+          <material><diffuse>0.95 0.68 0.12 1</diffuse></material>
+        </visual>
+      </link>
+    </model>
+  </world>
+</sdf>

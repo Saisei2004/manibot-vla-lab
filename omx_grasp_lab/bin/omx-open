@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+set -e
+source /opt/ros/jazzy/setup.bash
+ros2 action send_goal /gripper_controller/gripper_cmd control_msgs/action/GripperCommand "{command: {position: 0.019, max_effort: 10.0}}"

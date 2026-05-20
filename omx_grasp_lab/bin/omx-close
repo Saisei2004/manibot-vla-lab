@@ -1,0 +1,121 @@
+#!/usr/bin/env python3
+import time
+
+import rclpy
+from rclpy.action import ActionClient
+from rclpy.node import Node
+from sensor_msgs.msg import JointState
+from control_msgs.action import GripperCommand
+
+
+CLOSED_POSITION = -0.010
+CLOSE_EFFORT = 80.0
+OPEN_POSITION = 0.019
+PRESSURE_TARGET = 700.0
+PRESSURE_LIMIT = 950.0
+PRESSURE_BAND = 120.0
+RELEASE_STEP = 0.00008
+TIGHTEN_STEP = 0.00045
+HOLD_EFFORT = 70.0
+
+
+def clamp(value, low, high):
+    return max(low, min(high, value))
+
+
+class SoftClose(Node):
+    def __init__(self):
+        super().__init__("omx_soft_close")
+        self.client = ActionClient(self, GripperCommand, "/gripper_controller/gripper_cmd")
+        self.joint_state = None
+        self.create_subscription(JointState, "/joint_states", self.joint_state_callback, 10)
+
+    def joint_state_callback(self, msg):
+        samples = []
+        for name in ("gripper_left_joint", "gripper_right_joint"):
+            if name not in msg.name:
+                continue
+            idx = msg.name.index(name)
+            position = msg.position[idx] if idx < len(msg.position) else None
+            effort = abs(msg.effort[idx]) if idx < len(msg.effort) else None
+            samples.append((position, effort))
+        if not samples:
+            return
+        positions = [position for position, _ in samples if position is not None]
+        efforts = [effort for _, effort in samples if effort is not None]
+        self.joint_state = {
+            "position": sum(positions) / len(positions) if positions else None,
+            "effort": sum(efforts) / len(efforts) if efforts else None,
+        }
+
+    def send(self, position, effort):
+        goal = GripperCommand.Goal()
+        goal.command.position = clamp(position, CLOSED_POSITION, OPEN_POSITION)
+        goal.command.max_effort = effort
+        future = self.client.send_goal_async(goal)
+        rclpy.spin_until_future_complete(self, future)
+        handle = future.result()
+        if not handle or not handle.accepted:
+            raise RuntimeError("gripper goal was rejected")
+        result_future = handle.get_result_async()
+        rclpy.spin_until_future_complete(self, result_future)
+        return result_future.result().result
+
+    def sample_for(self, seconds):
+        end = time.monotonic() + seconds
+        while time.monotonic() < end:
+            rclpy.spin_once(self, timeout_sec=0.05)
+        return self.joint_state or {}
+
+    def regulate_pressure(self, duration=1.2):
+        joint = self.sample_for(0.15)
+        hold_position = clamp(joint.get("position", CLOSED_POSITION), CLOSED_POSITION, OPEN_POSITION)
+        deadline = time.monotonic() + duration
+        while time.monotonic() < deadline:
+            joint = self.sample_for(0.08)
+            position = joint.get("position")
+            effort = joint.get("effort")
+            effort_text = "none" if effort is None else f"{effort:.1f}"
+            position_text = "none" if position is None else f"{position:.5f}"
+            if position is None or effort is None:
+                print(f"pressure regulate: position={position_text} effort={effort_text}", flush=True)
+                continue
+
+            if effort > PRESSURE_LIMIT:
+                step = RELEASE_STEP * clamp((effort - PRESSURE_LIMIT) / 90.0, 1.0, 4.0)
+                hold_position = position + step
+            elif effort > PRESSURE_TARGET + PRESSURE_BAND:
+                hold_position += RELEASE_STEP
+            elif effort < PRESSURE_TARGET - PRESSURE_BAND:
+                hold_position -= TIGHTEN_STEP
+
+            hold_position = clamp(hold_position, CLOSED_POSITION, OPEN_POSITION)
+            print(
+                f"pressure regulate: position={position_text} effort={effort_text} "
+                f"hold_position={hold_position:.5f}",
+                flush=True,
+            )
+            self.send(hold_position, HOLD_EFFORT)
+
+
+def main():
+    rclpy.init()
+    node = SoftClose()
+    try:
+        print("waiting for gripper action server...", flush=True)
+        node.client.wait_for_server()
+        print(f"close gripper: position={CLOSED_POSITION:.3f} effort={CLOSE_EFFORT:.1f}", flush=True)
+        node.send(CLOSED_POSITION, CLOSE_EFFORT)
+        print(
+            f"regulate gripper pressure: target={PRESSURE_TARGET:.0f} "
+            f"limit={PRESSURE_LIMIT:.0f} hold_effort={HOLD_EFFORT:.1f}",
+            flush=True,
+        )
+        node.regulate_pressure()
+    finally:
+        node.destroy_node()
+        rclpy.shutdown()
+
+
+if __name__ == "__main__":
+    main()

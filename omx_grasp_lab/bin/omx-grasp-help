@@ -1,0 +1,48 @@
+#!/usr/bin/env bash
+cat <<'EOF'
+OpenMANIPULATOR X grasp lab:
+
+Terminal 1:
+  omx-grasp-gz
+  # random reachable object pose:
+  omx-random-grasp-gz
+  # repeated random grasp trials, auto reset after 3s hold:
+  omx-random-grasp-loop
+  omx-random-grasp-loop 5
+  # three fixed benchmark patterns: near/front, middle/left-back, far/right-back.
+  # Default is the fastest pipelined profile that has passed these three patterns:
+  omx-three-pattern-grasp
+  omx-three-pattern-grasp --profile safe
+
+Terminal 2:
+  omx-moveit-sim
+  # or use GUI controls:
+  omx-gui
+
+Manual gripper / rough pose commands after Gazebo is running:
+  omx-random-grasp
+  omx-random-grasp --profile safe
+  omx-random-grasp --profile turbo
+  omx-random-grasp --profile max
+  # comparison mode: run the same path without overlapping arm/gripper actions
+  omx-random-grasp --profile max --sequential
+  # calibrate the fast torque/gap gate against post-lift Gazebo truth labels
+  omx-calibrate-grasp-gate 10
+  omx-auto-grasp
+  omx-open
+  omx-pregrasp
+  omx-lower
+  omx-close
+  omx-lift
+  omx-home
+
+Start with omx-random-grasp-gz, wait for Gazebo to finish loading, then run
+omx-random-grasp in another terminal. The script uses analytic IK and a staged
+above-descend-push-hold-lift path. In max mode, gripper opening overlaps the
+first arm move, but the end effector stops at the grasp pose before closing.
+The script reads the gripper action result and /joint_states effort/position;
+it only lifts after contact is detected. Current fast gate is joint effort >=
+180 and gripper gap >= 0.006 m, calibrated against random reachable poses.
+
+For hands-off repeated trials, run omx-random-grasp-loop. Press Ctrl+C to stop.
+EOF

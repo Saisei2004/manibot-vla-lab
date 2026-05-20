@@ -1,0 +1,60 @@
+#!/usr/bin/env python3
+import json
+import random
+import xml.etree.ElementTree as ET
+from pathlib import Path
+
+home = Path.home()
+world_path = home / "robot_ws/worlds/omx_grasp_lab.sdf"
+target_path = home / ".ros/omx_grasp_target.json"
+
+objects = {
+    "grasp_small": {"z": 0.0225, "radius": 0.032},
+    "grasp_medium": {"z": 0.0275, "radius": 0.036},
+    "grasp_large": {"z": 0.040, "radius": 0.052},
+}
+
+
+def random_front_pose(placed, radius):
+    for _ in range(200):
+        x = random.uniform(0.175, 0.305)
+        y = random.uniform(-0.145, 0.145)
+        if all(((x - px) ** 2 + (y - py) ** 2) ** 0.5 > radius + pr + 0.020 for px, py, pr in placed):
+            return x, y
+    return random.uniform(0.19, 0.29), random.uniform(-0.12, 0.12)
+
+
+tree = ET.parse(world_path)
+root = tree.getroot()
+placed = []
+chosen_target = None
+
+for model in root.findall(".//model"):
+    name = model.attrib.get("name")
+    if name not in objects:
+        continue
+    spec = objects[name]
+    x, y = random_front_pose(placed, spec["radius"])
+    yaw = random.uniform(-0.35, 0.35)
+    placed.append((x, y, spec["radius"]))
+    pose = model.find("pose")
+    if pose is None:
+        pose = ET.SubElement(model, "pose")
+    pose.text = f"{x:.4f} {y:.4f} {spec['z']:.4f} 0 0 {yaw:.4f}"
+    if name == "grasp_medium":
+        chosen_target = {"name": name, "x": x, "y": y, "z": spec["z"], "yaw": yaw}
+
+if chosen_target is None:
+    raise SystemExit("grasp objects not found in world")
+
+tree.write(world_path, encoding="utf-8", xml_declaration=True)
+target_path.parent.mkdir(parents=True, exist_ok=True)
+target_path.write_text(json.dumps(chosen_target, indent=2) + "\n")
+
+for x, y, radius in placed:
+    print(f"object x={x:.3f} y={y:.3f} radius={radius:.3f}")
+print(
+    f"target {chosen_target['name']} x={chosen_target['x']:.3f} "
+    f"y={chosen_target['y']:.3f} z={chosen_target['z']:.3f}"
+)
+print(f"saved {target_path}")

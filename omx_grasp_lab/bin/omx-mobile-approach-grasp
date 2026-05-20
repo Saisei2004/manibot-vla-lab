@@ -1,0 +1,153 @@
+#!/usr/bin/env python3
+import json
+import math
+import os
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+MOBILE_TARGET_FILE = Path.home() / ".ros/omx_mobile_grasp_target.json"
+ARM_TARGET_FILE = Path.home() / ".ros/omx_grasp_target.json"
+WORLD_NAME = "omx_mobile_grasp_lab"
+GRASP_DISTANCE = 0.226
+
+
+def run(command, check=True):
+    print("+", command, flush=True)
+    return subprocess.run(
+        [
+            "bash",
+            "-lc",
+            "source /opt/ros/jazzy/setup.bash; "
+            "export PATH=/opt/ros/jazzy/opt/gz_tools_vendor/bin:$HOME/.local/bin:$PATH; "
+            f"{command}",
+        ],
+        check=check,
+        text=True,
+    )
+
+
+def run_capture(command, check=True):
+    print("+", command, flush=True)
+    return subprocess.run(
+        [
+            "bash",
+            "-lc",
+            "source /opt/ros/jazzy/setup.bash; "
+            "export PATH=/opt/ros/jazzy/opt/gz_tools_vendor/bin:$HOME/.local/bin:$PATH; "
+            f"{command}",
+        ],
+        check=check,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+    ).stdout
+
+
+def wait_ready():
+    deadline = time.monotonic() + 45.0
+    while time.monotonic() < deadline:
+        output = run_capture("timeout 4 ros2 action list", check=False)
+        if "/arm_controller/follow_joint_trajectory" in output and "/gripper_controller/gripper_cmd" in output:
+            return
+        time.sleep(1.0)
+    raise RuntimeError("robot controllers are not ready; start omx-mobile-grasp-gz first")
+
+
+def gz_set_pose(name, x, y, z, yaw):
+    half = yaw * 0.5
+    request = (
+        f'name: "{name}" '
+        f'position {{ x: {x:.5f} y: {y:.5f} z: {z:.5f} }} '
+        f'orientation {{ x: 0 y: 0 z: {math.sin(half):.7f} w: {math.cos(half):.7f} }}'
+    )
+    command = (
+        f"gz service -s /world/{WORLD_NAME}/set_pose "
+        "--reqtype gz.msgs.Pose --reptype gz.msgs.Boolean --timeout 2000 "
+        f"--req '{request}'"
+    )
+    return run(command, check=False).returncode == 0
+
+
+def ease(t):
+    return t * t * (3.0 - 2.0 * t)
+
+
+def lerp_angle(a, b, t):
+    diff = math.atan2(math.sin(b - a), math.cos(b - a))
+    return a + diff * t
+
+
+def write_relative_arm_target(target, base_x, base_y):
+    rel_x = target["x"] - base_x
+    rel_y = target["y"] - base_y
+    ARM_TARGET_FILE.parent.mkdir(parents=True, exist_ok=True)
+    ARM_TARGET_FILE.write_text(
+        json.dumps(
+            {
+                "x": rel_x,
+                "y": rel_y,
+                "z": 0.035,
+                "yaw": 0.0,
+                "mobile_relative": True,
+            },
+            indent=2,
+        )
+        + "\n"
+    )
+
+
+def main():
+    hold_seconds = 3.0
+    if "--hold" in sys.argv:
+        idx = sys.argv.index("--hold")
+        hold_seconds = float(sys.argv[idx + 1])
+
+    if not MOBILE_TARGET_FILE.exists():
+        raise SystemExit("No mobile target found. Start Gazebo with omx-mobile-grasp-gz first.")
+
+    wait_ready()
+    target = json.loads(MOBILE_TARGET_FILE.read_text())
+    tx, ty = target["x"], target["y"]
+    face_yaw = math.atan2(ty, tx)
+    base_x = tx - math.cos(face_yaw) * GRASP_DISTANCE
+    base_y = ty - math.sin(face_yaw) * GRASP_DISTANCE
+
+    print(
+        "Mobile target: "
+        f"x={tx:.3f} y={ty:.3f}; base goal x={base_x:.3f} y={base_y:.3f} "
+        f"yaw={face_yaw:.3f} arm_relative={GRASP_DISTANCE:.3f}"
+    )
+
+    steps = 28
+    print("[1/4] drive mobile base toward grasp stand-off")
+    for idx in range(steps + 1):
+        amount = ease(idx / steps)
+        x = base_x * amount
+        y = base_y * amount
+        yaw = lerp_angle(0.0, face_yaw, amount)
+        gz_set_pose("mobile_base_marker", x, y, 0.025, yaw)
+        time.sleep(0.06)
+
+    print("[2/4] align arm target in robot-local frame")
+    previous_target = ARM_TARGET_FILE.read_text() if ARM_TARGET_FILE.exists() else None
+    write_relative_arm_target(target, base_x, base_y)
+
+    try:
+        print("[3/4] grasp with OpenMANIPULATOR X")
+        code = run(
+            f"OMX_ALLOW_ARM_TIMEOUT=1 OMX_ARM_TIMEOUT_MARGIN=30.0 "
+            f"omx-random-grasp --profile max --hold {hold_seconds}",
+            check=False,
+        ).returncode
+    finally:
+        if previous_target is not None:
+            ARM_TARGET_FILE.write_text(previous_target)
+
+    print("[4/4] mobile grasp sequence complete")
+    raise SystemExit(code)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,71 @@
+#!/usr/bin/env python3
+import os
+import signal
+import subprocess
+import sys
+import time
+
+PATTERNS = [
+    ("near", 0.205, 0.0),
+    ("middle", 0.265, 120.0),
+    ("far", 0.325, -120.0),
+]
+
+
+def run(cmd, check=True):
+    print("+", cmd, flush=True)
+    return subprocess.run(["bash", "-lc", f"source /opt/ros/jazzy/setup.bash; export PATH=$HOME/.local/bin:$PATH; {cmd}"], check=check)
+
+
+def terminate(proc):
+    if proc.poll() is not None:
+        return
+    try:
+        os.killpg(proc.pid, signal.SIGTERM)
+        proc.wait(timeout=8)
+    except Exception:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except Exception:
+            pass
+
+
+def main():
+    if "--help" in sys.argv or "-h" in sys.argv:
+        print("usage: omx-three-pattern-grasp [--profile safe|fast|turbo|max]")
+        print("Runs near, middle, and far benchmark grasps. Default profile: max.")
+        return
+
+    profile = "max"
+    if "--profile" in sys.argv:
+        idx = sys.argv.index("--profile")
+        if idx + 1 >= len(sys.argv):
+            raise SystemExit("--profile requires safe, fast, turbo, or max")
+        profile = sys.argv[idx + 1]
+
+    for name, radius, theta_deg in PATTERNS:
+        print(f"\n=== {name}: r={radius:.3f}m theta={theta_deg:.0f}deg profile={profile} ===", flush=True)
+        run(f"omx-set-grasp-target {radius:.3f} {theta_deg:.1f}")
+        launch = subprocess.Popen(
+            [
+                "bash",
+                "-lc",
+                "source /opt/ros/jazzy/setup.bash; export DISPLAY=${DISPLAY:-:0}; export PATH=$HOME/.local/bin:$PATH; ros2 launch open_manipulator_bringup open_manipulator_x_gazebo.launch.py world:=$HOME/robot_ws/worlds/omx_grasp_lab",
+            ],
+            preexec_fn=os.setsid,
+        )
+        started = time.monotonic()
+        try:
+            print("waiting for Gazebo/controllers...", flush=True)
+            time.sleep(18)
+            grasp_started = time.monotonic()
+            run(f"omx-random-grasp --profile {profile} --hold 1")
+            print(f"grasp wall time: {time.monotonic() - grasp_started:.1f}s", flush=True)
+        finally:
+            print(f"resetting world after {time.monotonic() - started:.1f}s...", flush=True)
+            terminate(launch)
+            time.sleep(3)
+
+
+if __name__ == "__main__":
+    main()

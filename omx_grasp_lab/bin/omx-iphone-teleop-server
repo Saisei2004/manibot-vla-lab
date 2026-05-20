@@ -1,0 +1,354 @@
+#!/usr/bin/env python3
+import json
+import math
+import socket
+import threading
+import time
+
+import numpy as np
+from scipy.optimize import least_squares
+
+import rclpy
+from rclpy.action import ActionClient
+from rclpy.node import Node
+from sensor_msgs.msg import JointState
+from trajectory_msgs.msg import JointTrajectoryPoint
+from control_msgs.action import FollowJointTrajectory, GripperCommand
+
+
+HOST = "0.0.0.0"
+PORT = 8766
+SEND_PERIOD = 0.12
+CLOSED_GRIPPER_POSITION = -0.010
+OPEN_GRIPPER_POSITION = 0.019
+GRIPPER_CLOSE_EFFORT = 80.0
+GRIPPER_OPEN_EFFORT = 18.0
+GRIPPER_HOLD_EFFORT = 70.0
+GRIPPER_PRESSURE_TARGET = 700.0
+GRIPPER_PRESSURE_LIMIT = 950.0
+GRIPPER_PRESSURE_BAND = 120.0
+GRIPPER_RELEASE_STEP = 0.00008
+GRIPPER_TIGHTEN_STEP = 0.00045
+GRIPPER_COMMAND_EPSILON = 0.00025
+GRIPPER_COMMAND_PERIOD = 0.18
+
+JOINT1_LOWER = -math.pi
+JOINT1_UPPER = math.pi
+MAX_PITCH = 1.70
+HOME_X = 0.215
+HOME_Y = 0.0
+HOME_Z = 0.135
+POSE_X_RANGE = 0.250
+POSE_Y_RANGE = 0.360
+POSE_Z_RANGE = 0.270
+
+LINEAR_SPEED = 0.115
+Z_SPEED = 0.095
+
+
+def t(x, y, z):
+    matrix = np.eye(4)
+    matrix[:3, 3] = [x, y, z]
+    return matrix
+
+
+def ry(q):
+    c, s = math.cos(q), math.sin(q)
+    return np.array([[c, 0, s, 0], [0, 1, 0, 0], [-s, 0, c, 0], [0, 0, 0, 1]], dtype=float)
+
+
+def planar_fk(q):
+    q2, q3, q4 = q
+    matrix = np.eye(4)
+    matrix = matrix @ t(0.012, 0, 0)
+    matrix = matrix @ t(0, 0, 0.0595) @ ry(q2)
+    matrix = matrix @ t(0.024, 0, 0.128) @ ry(q3)
+    matrix = matrix @ t(0.124, 0, 0) @ ry(q4)
+    matrix = matrix @ t(0.126, 0, 0)
+    return matrix[:3, 3]
+
+
+def solve_planar(radial, z, pitch=0.0):
+    target = np.array([radial, 0.0, z], dtype=float)
+
+    def residual(q):
+        position_error = (planar_fk(q) - target) * 12.0
+        pitch_error = np.array([(q[0] + q[1] + q[2] - pitch) * 1.8])
+        return np.concatenate([position_error, pitch_error])
+
+    seeds = [
+        (-0.2, 0.6, -0.4),
+        (0.1, 0.8, -0.9),
+        (-0.3, 0.2, 0.1),
+        (0.35, 0.8, -1.35),
+        (-0.5, 1.0, -0.3),
+    ]
+    best = None
+    for seed in seeds:
+        result = least_squares(
+            residual,
+            seed,
+            bounds=([-1.5, -1.5, -1.7], [1.5, 1.4, 1.97]),
+            xtol=1e-5,
+            ftol=1e-5,
+            gtol=1e-5,
+            max_nfev=120,
+        )
+        if best is None or result.cost < best.cost:
+            best = result
+    if best is None or best.cost > 1e-3:
+        raise RuntimeError(f"IK failed radial={radial:.3f} z={z:.3f}")
+    return best.x.tolist()
+
+
+def clamp(value, low, high):
+    return max(low, min(high, value))
+
+
+class IPhoneTeleop(Node):
+    def __init__(self):
+        super().__init__("omx_iphone_teleop")
+        self.arm_client = ActionClient(self, FollowJointTrajectory, "/arm_controller/follow_joint_trajectory")
+        self.gripper_client = ActionClient(self, GripperCommand, "/gripper_controller/gripper_cmd")
+        self.create_subscription(JointState, "/joint_states", self.joint_state_callback, 10)
+        self.lock = threading.Lock()
+        self.target_x = HOME_X
+        self.target_y = HOME_Y
+        self.target_z = HOME_Z
+        self.target_pitch = 0.0
+        self.close_gripper = False
+        self.gripper_open_amount = 1.0
+        self.force_gripper_state = "open"
+        self.last_packet_time = time.monotonic()
+        self.last_motion_time = 0.0
+        self.last_gripper_position = None
+        self.last_gripper_send_time = 0.0
+        self.gripper_joint_position = None
+        self.gripper_joint_effort = None
+        self.relaxed_gripper_position = None
+        self.last_log_time = 0.0
+
+    def start_udp(self):
+        thread = threading.Thread(target=self.udp_loop, daemon=True)
+        thread.start()
+
+    def udp_loop(self):
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.bind((HOST, PORT))
+        sock.settimeout(0.5)
+        print(f"iPhone teleop UDP server listening on {HOST}:{PORT}", flush=True)
+        while rclpy.ok():
+            try:
+                data, addr = sock.recvfrom(2048)
+            except socket.timeout:
+                continue
+            try:
+                message = json.loads(data.decode("utf-8"))
+            except Exception:
+                continue
+            self.apply_message(message)
+
+    def apply_message(self, message):
+        now = time.monotonic()
+        with self.lock:
+            dt = clamp(now - self.last_packet_time, 0.0, 0.08)
+            self.last_packet_time = now
+
+            if message.get("mode") == "pose":
+                px = clamp(float(message.get("px", 0.0)), -1.0, 1.0)
+                py = clamp(float(message.get("py", 0.0)), -1.0, 1.0)
+                pz = clamp(float(message.get("pz", 0.0)), -1.0, 1.0)
+                scale = 1.25 if message.get("boost") else 1.0
+                self.target_x = HOME_X + px * POSE_X_RANGE * scale
+                self.target_y = HOME_Y + py * POSE_Y_RANGE * scale
+                self.target_z = HOME_Z + pz * POSE_Z_RANGE * scale
+                self.target_pitch = clamp(float(message.get("pitch", 0.0)), -1.0, 1.0) * MAX_PITCH
+                self.force_gripper_state = str(message.get("grip_force", "none"))
+                self.gripper_open_amount = clamp(float(message.get("grip", 1.0)), 0.0, 1.0)
+                if self.force_gripper_state == "close":
+                    self.gripper_open_amount = 0.0
+                elif self.force_gripper_state == "open":
+                    self.gripper_open_amount = 1.0
+                    self.relaxed_gripper_position = None
+                self.close_gripper = self.force_gripper_state == "close" or self.gripper_open_amount < 0.35
+            else:
+                vx = clamp(float(message.get("x", 0.0)), -1.0, 1.0)
+                vy = clamp(float(message.get("y", 0.0)), -1.0, 1.0)
+                vz = clamp(float(message.get("z", 0.0)), -1.0, 1.0)
+                boost = 1.6 if message.get("boost") else 1.0
+
+                self.target_x += vx * LINEAR_SPEED * boost * dt
+                self.target_y += vy * LINEAR_SPEED * boost * dt
+                self.target_z += vz * Z_SPEED * boost * dt
+                self.close_gripper = bool(message.get("close", False))
+                self.gripper_open_amount = 0.0 if self.close_gripper else 1.0
+                self.force_gripper_state = "close" if self.close_gripper else "open"
+                if self.force_gripper_state == "open":
+                    self.relaxed_gripper_position = None
+
+            if message.get("reset"):
+                self.target_x = HOME_X
+                self.target_y = HOME_Y
+                self.target_z = HOME_Z
+                self.target_pitch = 0.0
+                self.gripper_open_amount = 1.0
+                self.close_gripper = False
+                self.force_gripper_state = "open"
+                self.relaxed_gripper_position = None
+
+            self.clamp_workspace_locked()
+
+    def joint_state_callback(self, msg):
+        samples = []
+        for name in ("gripper_left_joint", "gripper_right_joint"):
+            if name not in msg.name:
+                continue
+            idx = msg.name.index(name)
+            position = msg.position[idx] if idx < len(msg.position) else None
+            effort = abs(msg.effort[idx]) if idx < len(msg.effort) else None
+            samples.append((position, effort))
+        if not samples:
+            return
+        positions = [position for position, _ in samples if position is not None]
+        efforts = [effort for _, effort in samples if effort is not None]
+        with self.lock:
+            if positions:
+                self.gripper_joint_position = sum(positions) / len(positions)
+            if efforts:
+                self.gripper_joint_effort = sum(efforts) / len(efforts)
+
+    def clamp_workspace_locked(self):
+        # Cartesian software fences are intentionally not applied here. Reach is
+        # limited by the URDF joint bounds in IK and by the ros2_control joints.
+        return
+
+    def tick(self):
+        now = time.monotonic()
+        with self.lock:
+            stale = now - self.last_packet_time > 0.6
+            x, y, z = self.target_x, self.target_y, self.target_z
+            pitch = self.target_pitch
+            grip = self.gripper_open_amount
+            force_state = self.force_gripper_state
+            measured_position = self.gripper_joint_position
+            measured_effort = self.gripper_joint_effort
+            relaxed_position = self.relaxed_gripper_position
+        if stale:
+            return
+        if now - self.last_motion_time >= SEND_PERIOD:
+            self.send_arm_target(x, y, z, pitch)
+            self.last_motion_time = now
+        if force_state == "close":
+            gripper_position = CLOSED_GRIPPER_POSITION
+        elif force_state == "open":
+            gripper_position = OPEN_GRIPPER_POSITION
+        else:
+            gripper_position = CLOSED_GRIPPER_POSITION + clamp(grip, 0.0, 1.0) * (
+                OPEN_GRIPPER_POSITION - CLOSED_GRIPPER_POSITION
+            )
+        pressure_mode = force_state == "close" or gripper_position <= CLOSED_GRIPPER_POSITION + 0.004
+        if not pressure_mode:
+            with self.lock:
+                self.relaxed_gripper_position = None
+            relaxed_position = None
+        elif measured_position is not None:
+            hold_position = relaxed_position if relaxed_position is not None else gripper_position
+            if measured_effort is not None:
+                if measured_effort > GRIPPER_PRESSURE_LIMIT:
+                    step = GRIPPER_RELEASE_STEP * clamp((measured_effort - GRIPPER_PRESSURE_LIMIT) / 90.0, 1.0, 4.0)
+                    hold_position = measured_position + step
+                    print(
+                        "gripper pressure limit: "
+                        f"effort={measured_effort:.1f}, easing to {hold_position:.4f}",
+                        flush=True,
+                    )
+                elif measured_effort > GRIPPER_PRESSURE_TARGET + GRIPPER_PRESSURE_BAND:
+                    hold_position += GRIPPER_RELEASE_STEP
+                elif measured_effort < GRIPPER_PRESSURE_TARGET - GRIPPER_PRESSURE_BAND:
+                    hold_position -= GRIPPER_TIGHTEN_STEP
+            relaxed_position = clamp(
+                max(gripper_position, hold_position),
+                CLOSED_GRIPPER_POSITION,
+                OPEN_GRIPPER_POSITION,
+            )
+            with self.lock:
+                self.relaxed_gripper_position = relaxed_position
+        hold_effort = None
+        if relaxed_position is not None and gripper_position <= relaxed_position:
+            gripper_position = relaxed_position
+            hold_effort = GRIPPER_HOLD_EFFORT
+        should_send = (
+            self.last_gripper_position is None
+            or abs(gripper_position - self.last_gripper_position) > GRIPPER_COMMAND_EPSILON
+            or (pressure_mode and now - self.last_gripper_send_time >= GRIPPER_COMMAND_PERIOD)
+        )
+        if should_send:
+            self.send_gripper_position(gripper_position, hold_effort)
+            self.last_gripper_position = gripper_position
+            self.last_gripper_send_time = now
+        if now - self.last_log_time > 1.0:
+            self.last_log_time = now
+            effort_text = "none" if measured_effort is None else f"{measured_effort:.1f}"
+            print(
+                f"target x={x:.3f} y={y:.3f} z={z:.3f} "
+                f"pitch={pitch:.2f} gripper_open={grip:.2f} gripper_effort={effort_text}",
+                flush=True,
+            )
+
+    def send_arm_target(self, x, y, z, pitch):
+        radial = math.hypot(x, y)
+        q1 = clamp(math.atan2(y, x), JOINT1_LOWER, JOINT1_UPPER)
+        joints = None
+        last_error = None
+        for pitch_scale in (1.0, 0.72, 0.45, 0.0):
+            try:
+                joints = [q1] + solve_planar(radial, z, pitch=pitch * pitch_scale)
+                break
+            except Exception as exc:
+                last_error = exc
+        if joints is None:
+            self.get_logger().warn(str(last_error))
+            return
+
+        goal = FollowJointTrajectory.Goal()
+        goal.trajectory.joint_names = ["joint1", "joint2", "joint3", "joint4"]
+        point = JointTrajectoryPoint()
+        point.positions = joints
+        point.time_from_start.sec = 0
+        point.time_from_start.nanosec = int(SEND_PERIOD * 1_000_000_000)
+        goal.trajectory.points = [point]
+        self.arm_client.send_goal_async(goal)
+
+    def send_gripper(self, close):
+        self.send_gripper_position(CLOSED_GRIPPER_POSITION if close else OPEN_GRIPPER_POSITION)
+
+    def send_gripper_position(self, position, effort=None):
+        goal = GripperCommand.Goal()
+        goal.command.position = clamp(position, CLOSED_GRIPPER_POSITION, OPEN_GRIPPER_POSITION)
+        if effort is None:
+            effort = GRIPPER_CLOSE_EFFORT if position <= CLOSED_GRIPPER_POSITION + 0.001 else GRIPPER_OPEN_EFFORT
+        goal.command.max_effort = effort
+        self.gripper_client.send_goal_async(goal)
+
+
+def main():
+    rclpy.init()
+    node = IPhoneTeleop()
+    print("waiting for arm and gripper action servers...", flush=True)
+    node.arm_client.wait_for_server()
+    node.gripper_client.wait_for_server()
+    node.send_gripper_position(OPEN_GRIPPER_POSITION)
+    node.last_gripper_position = OPEN_GRIPPER_POSITION
+    print(f"initial gripper open command sent: {OPEN_GRIPPER_POSITION:.3f}", flush=True)
+    node.start_udp()
+    try:
+        while rclpy.ok():
+            rclpy.spin_once(node, timeout_sec=0.03)
+            node.tick()
+    finally:
+        node.destroy_node()
+        rclpy.shutdown()
+
+
+if __name__ == "__main__":
+    main()

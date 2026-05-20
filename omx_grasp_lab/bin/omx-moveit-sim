@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+set -e
+source /opt/ros/jazzy/setup.bash
+ros2 launch open_manipulator_moveit_config open_manipulator_x_moveit.launch.py use_sim:=true

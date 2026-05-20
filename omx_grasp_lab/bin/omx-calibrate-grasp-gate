@@ -1,0 +1,186 @@
+#!/usr/bin/env python3
+import json
+import os
+import signal
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+
+def run(cmd, check=True):
+    print("+", cmd, flush=True)
+    return subprocess.run(
+        ["bash", "-lc", f"source /opt/ros/jazzy/setup.bash; export PATH=$HOME/.local/bin:$PATH; {cmd}"],
+        check=check,
+        text=True,
+    )
+
+
+def terminate(proc):
+    if proc.poll() is not None:
+        return
+    try:
+        os.killpg(proc.pid, signal.SIGTERM)
+        proc.wait(timeout=8)
+    except Exception:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except Exception:
+            pass
+
+
+def launch_world():
+    return subprocess.Popen(
+        [
+            "bash",
+            "-lc",
+            "source /opt/ros/jazzy/setup.bash; export DISPLAY=${DISPLAY:-:0}; "
+            "ros2 launch open_manipulator_bringup open_manipulator_x_gazebo.launch.py "
+            "world:=$HOME/robot_ws/worlds/omx_grasp_lab",
+        ],
+        preexec_fn=os.setsid,
+    )
+
+
+def evaluate_threshold(records, effort_threshold, gap_threshold=0.006):
+    total = 0
+    correct = 0
+    tp = fp = tn = fn = 0
+    for record in records:
+        truth = record.get("truth") or {}
+        metrics = record.get("metrics") or {}
+        if not truth.get("available"):
+            continue
+        total += 1
+        effort = metrics.get("joint_effort") or 0.0
+        gap = metrics.get("contact_gap_value") or 0.0
+        pred = effort >= effort_threshold and gap >= gap_threshold
+        actual = bool(truth.get("success"))
+        if pred == actual:
+            correct += 1
+        if pred and actual:
+            tp += 1
+        elif pred and not actual:
+            fp += 1
+        elif not pred and actual:
+            fn += 1
+        else:
+            tn += 1
+    accuracy = correct / total if total else 0.0
+    precision = tp / (tp + fp) if tp + fp else 0.0
+    recall = tp / (tp + fn) if tp + fn else 0.0
+    return {
+        "threshold": effort_threshold,
+        "gap_threshold": gap_threshold,
+        "total": total,
+        "accuracy": accuracy,
+        "precision": precision,
+        "recall": recall,
+        "tp": tp,
+        "fp": fp,
+        "tn": tn,
+        "fn": fn,
+    }
+
+
+def choose_threshold(records):
+    positives = []
+    negatives = []
+    for record in records:
+        truth = record.get("truth") or {}
+        metrics = record.get("metrics") or {}
+        if not truth.get("available"):
+            continue
+        effort = metrics.get("joint_effort") or 0.0
+        if truth.get("success"):
+            positives.append(effort)
+        else:
+            negatives.append(effort)
+
+    if positives and negatives and max(negatives) < min(positives):
+        threshold = (max(negatives) + min(positives)) / 2.0
+        return evaluate_threshold(records, threshold)
+
+    efforts = sorted(
+        {
+            round((record.get("metrics") or {}).get("joint_effort") or 0.0, 3)
+            for record in records
+            if (record.get("truth") or {}).get("available")
+        }
+    )
+    candidates = [0.0, 25.0, 50.0, 75.0, 100.0, 150.0, 200.0, 250.0, 300.0, 350.0]
+    candidates.extend(efforts)
+    best = None
+    for threshold in sorted(set(candidates)):
+        result = evaluate_threshold(records, threshold)
+        if result["accuracy"] < 0.90:
+            continue
+        if best is None:
+            best = result
+            continue
+        # Prefer higher precision, then higher recall, then lower threshold for speed/sensitivity.
+        key = (result["precision"], result["recall"], -result["threshold"])
+        best_key = (best["precision"], best["recall"], -best["threshold"])
+        if key > best_key:
+            best = result
+    if best is None:
+        best = max((evaluate_threshold(records, t) for t in sorted(set(candidates))), key=lambda r: r["accuracy"])
+    return best
+
+
+def main():
+    count = 10
+    if len(sys.argv) > 1:
+        count = int(sys.argv[1])
+
+    out_dir = Path.home() / ".ros/omx_grasp_gate_trials"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    records = []
+    started = time.strftime("%Y%m%d-%H%M%S")
+
+    for i in range(1, count + 1):
+        print(f"\n=== calibration trial {i}/{count} ===", flush=True)
+        run("omx-randomize-object")
+        launch = launch_world()
+        result_path = out_dir / f"{started}-trial-{i:02d}.json"
+        try:
+            print("waiting for Gazebo/controllers...", flush=True)
+            time.sleep(18)
+            code = run(f"omx-random-grasp --profile max --hold 0 --truth-label --no-gate --json-result {result_path}", check=False).returncode
+            if result_path.exists():
+                record = json.loads(result_path.read_text())
+                record["trial"] = i
+                record["exit_code"] = code
+                records.append(record)
+                truth = record.get("truth") or {}
+                metrics = record.get("metrics") or {}
+                print(
+                    "trial result: "
+                    f"truth={truth.get('success')} "
+                    f"effort={metrics.get('joint_effort')} "
+                    f"gap={metrics.get('contact_gap_value')} "
+                    f"fast_gate={record.get('fast_gate_ok')}",
+                    flush=True,
+                )
+            else:
+                print("trial produced no result file", flush=True)
+        finally:
+            print("resetting world...", flush=True)
+            terminate(launch)
+            time.sleep(2)
+
+    summary = {
+        "trial_count": len(records),
+        "chosen": choose_threshold(records) if records else None,
+        "records": records,
+    }
+    summary_path = out_dir / f"{started}-summary.json"
+    summary_path.write_text(json.dumps(summary, indent=2) + "\n")
+    print("\n=== calibration summary ===")
+    print(json.dumps(summary["chosen"], indent=2))
+    print(f"summary: {summary_path}")
+
+
+if __name__ == "__main__":
+    main()

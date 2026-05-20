@@ -1,0 +1,9 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=Close Gripper
+Comment=Close the OpenMANIPULATOR X gripper harder
+Icon=go-down
+Terminal=false
+Exec=xfce4-terminal --title="Close Gripper" --hold --command="bash -lc 'export PATH=$HOME/.local/bin:$PATH; source /opt/ros/jazzy/setup.bash; omx-close'"
+Categories=Development;Robotics;

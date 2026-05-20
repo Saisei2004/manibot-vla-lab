@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+set -e
+echo "omx-mobile-grasp-gz is now redirected to the no-cart grasp world."
+exec omx-grasp-gz

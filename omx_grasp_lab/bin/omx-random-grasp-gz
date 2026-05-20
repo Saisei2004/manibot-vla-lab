@@ -1,0 +1,65 @@
+#!/usr/bin/env bash
+set -e
+
+source /opt/ros/jazzy/setup.bash
+
+export DISPLAY="${DISPLAY:-:0}"
+export PATH="$HOME/.local/bin:$PATH"
+WORLD_PATH="$HOME/robot_ws/worlds/omx_grasp_lab"
+launch_pid=""
+
+stop_stale_gazebo() {
+  pkill -TERM -f "open_manipulator_x_gazebo.launch.py" 2>/dev/null || true
+  pkill -TERM -f "gz sim.*omx_grasp_lab" 2>/dev/null || true
+  pkill -TERM -f "parameter_bridge" 2>/dev/null || true
+  sleep 1
+  pkill -KILL -f "open_manipulator_x_gazebo.launch.py" 2>/dev/null || true
+  pkill -KILL -f "gz sim.*omx_grasp_lab" 2>/dev/null || true
+  pkill -KILL -f "parameter_bridge" 2>/dev/null || true
+}
+
+wait_for_world() {
+  local deadline=$((SECONDS + 70))
+  while [ "$SECONDS" -lt "$deadline" ]; do
+    if timeout 4 ros2 action list 2>/dev/null \
+      | grep -q "/arm_controller/follow_joint_trajectory" \
+      && timeout 4 ros2 action list 2>/dev/null \
+      | grep -q "/gripper_controller/gripper_cmd"; then
+      return 0
+    fi
+    sleep 1
+  done
+  return 1
+}
+
+cleanup_current_launch() {
+  if [ -n "$launch_pid" ] && kill -0 "$launch_pid" 2>/dev/null; then
+    kill "$launch_pid" 2>/dev/null || true
+    wait "$launch_pid" 2>/dev/null || true
+  fi
+  stop_stale_gazebo
+}
+
+trap cleanup_current_launch EXIT INT TERM
+
+omx-randomize-object
+
+for attempt in 1 2; do
+  stop_stale_gazebo
+  echo "Starting Gazebo attempt ${attempt}/2 on DISPLAY=${DISPLAY}"
+  ros2 launch open_manipulator_bringup open_manipulator_x_gazebo.launch.py world:="$WORLD_PATH" &
+  launch_pid=$!
+
+  if wait_for_world; then
+    echo "Gazebo world is ready. Keep this terminal open."
+    wait "$launch_pid"
+    exit $?
+  fi
+
+  echo "Gazebo did not become ready; restarting..."
+  kill "$launch_pid" 2>/dev/null || true
+  wait "$launch_pid" 2>/dev/null || true
+done
+
+echo "Gazebo could not be started. Try closing the Gazebo window and run omx-random-grasp-gz again." >&2
+exit 1

@@ -1,0 +1,708 @@
+#!/usr/bin/env python3
+import json
+import math
+import os
+import re
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+try:
+    import numpy as np
+    from scipy.optimize import least_squares
+except Exception as exc:
+    raise SystemExit(f"scipy/numpy are required for IK: {exc}")
+
+TARGET_FILE = Path.home() / ".ros/omx_grasp_target.json"
+RESULT_FILE = Path.home() / ".ros/omx_grasp_result.json"
+TCP_CENTER_FORWARD_OFFSET = 0.0
+TCP_PUSH_START_OFFSET = -0.025
+GRASP_Z = 0.048
+APPROACH_Z = 0.145
+LIFT_Z = 0.185
+FAST_GATE_MIN_GAP = 0.006
+FAST_GATE_MIN_EFFORT = 180.0
+OPEN_GRIPPER_POSITION = 0.019
+OPEN_GRIPPER_EFFORT = 18.0
+CLOSED_GRIPPER_POSITION = -0.010
+CLOSED_GRIPPER_EFFORT = 80.0
+GRIPPER_PRESSURE_TARGET = 700.0
+GRIPPER_PRESSURE_LIMIT = 950.0
+GRIPPER_PRESSURE_BAND = 120.0
+GRIPPER_RELEASE_STEP = 0.00008
+GRIPPER_TIGHTEN_STEP = 0.00045
+GRIPPER_HOLD_EFFORT = 70.0
+OPEN_MIN_JOINT_POSITION = 0.0085
+OPEN_RETRIES = 3
+TRUTH_MIN_LIFT_Z = 0.080
+TRUTH_MAX_XY_ERROR = 0.070
+
+PROFILES = {
+    "safe": {"approach": 4.0, "descend": 3.0, "push": 2.0, "lift": 4.0},
+    "fast": {"approach": 2.0, "descend": 1.5, "push": 1.0, "lift": 2.0},
+    "turbo": {"approach": 1.4, "descend": 1.0, "push": 0.7, "lift": 1.5},
+    "max": {"approach": 0.9, "descend": 0.65, "push": 0.45, "close_settle": 0.25, "lift": 1.0},
+}
+
+
+def t(x, y, z):
+    matrix = np.eye(4)
+    matrix[:3, 3] = [x, y, z]
+    return matrix
+
+
+def ry(q):
+    c, s = math.cos(q), math.sin(q)
+    return np.array([[c, 0, s, 0], [0, 1, 0, 0], [-s, 0, c, 0], [0, 0, 0, 1]], dtype=float)
+
+
+def planar_fk(q):
+    q2, q3, q4 = q
+    matrix = np.eye(4)
+    matrix = matrix @ t(0.012, 0, 0)
+    matrix = matrix @ t(0, 0, 0.0595) @ ry(q2)
+    matrix = matrix @ t(0.024, 0, 0.128) @ ry(q3)
+    matrix = matrix @ t(0.124, 0, 0) @ ry(q4)
+    matrix = matrix @ t(0.126, 0, 0)
+    return matrix[:3, 3]
+
+
+def solve_planar(radial, z, pitch=0.0):
+    target = np.array([radial, 0.0, z], dtype=float)
+
+    def residual(q):
+        position_error = (planar_fk(q) - target) * 12.0
+        pitch_error = np.array([(q[0] + q[1] + q[2] - pitch) * 1.8])
+        return np.concatenate([position_error, pitch_error])
+
+    seeds = [
+        (-0.2, 0.6, -0.4),
+        (0.1, 0.8, -0.9),
+        (-0.3, 0.2, 0.1),
+        (0.35, 0.8, -1.35),
+        (-0.5, 1.0, -0.3),
+    ]
+    best = None
+    for seed in seeds:
+        result = least_squares(
+            residual,
+            seed,
+            bounds=([-1.5, -1.5, -1.7], [1.5, 1.4, 1.97]),
+            xtol=1e-5,
+            ftol=1e-5,
+            gtol=1e-5,
+            max_nfev=200,
+        )
+        if best is None or result.cost < best.cost:
+            best = result
+
+    if best is None or best.cost > 1e-3:
+        raise RuntimeError(f"IK failed for radial={radial:.3f} z={z:.3f}; cost={getattr(best, 'cost', None)}")
+    return best.x.tolist()
+
+
+def run(command):
+    print("+", command)
+    subprocess.run(["bash", "-lc", f"source /opt/ros/jazzy/setup.bash; {command}"], check=True)
+
+
+def run_arm_action(command, expected_seconds):
+    allow_timeout = os.environ.get("OMX_ALLOW_ARM_TIMEOUT", "").lower() in ("1", "true", "yes")
+    margin = float(os.environ.get("OMX_ARM_TIMEOUT_MARGIN", "8.0"))
+    timeout_seconds = max(expected_seconds + margin, 6.0)
+    wrapped = f"timeout {timeout_seconds:.1f}s {command}"
+    print("+", wrapped)
+    result = subprocess.run(["bash", "-lc", f"source /opt/ros/jazzy/setup.bash; {wrapped}"], check=False)
+    if result.returncode == 124 and allow_timeout:
+        print(f"Arm action timed out after {timeout_seconds:.1f}s; continuing by request.")
+        return
+    if result.returncode != 0:
+        raise subprocess.CalledProcessError(result.returncode, wrapped)
+
+
+def run_capture(command):
+    print("+", command)
+    return subprocess.run(
+        ["bash", "-lc", f"source /opt/ros/jazzy/setup.bash; {command}"],
+        check=True,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+    ).stdout
+
+
+def run_capture_optional(command):
+    print("+", command)
+    return subprocess.run(
+        ["bash", "-lc", f"source /opt/ros/jazzy/setup.bash; {command}"],
+        check=False,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+    ).stdout
+
+
+def run_async(command):
+    print("+", command)
+    return subprocess.Popen(["bash", "-lc", f"source /opt/ros/jazzy/setup.bash; {command}"])
+
+
+def ros_duration(seconds):
+    whole = int(seconds)
+    nano = int(round((seconds - whole) * 1_000_000_000))
+    if nano >= 1_000_000_000:
+        whole += 1
+        nano -= 1_000_000_000
+    return whole, nano
+
+
+def send_arm(joints, seconds=3):
+    sec, nanosec = ros_duration(seconds)
+    payload = (
+        "{trajectory: {joint_names: [joint1, joint2, joint3, joint4], points: "
+        f"[{{positions: [{joints[0]:.5f}, {joints[1]:.5f}, {joints[2]:.5f}, {joints[3]:.5f}], "
+        f"time_from_start: {{sec: {sec}, nanosec: {nanosec}}}}}]}}}}"
+    )
+    run_arm_action(
+        f"ros2 action send_goal /arm_controller/follow_joint_trajectory control_msgs/action/FollowJointTrajectory '{payload}'",
+        seconds,
+    )
+
+
+def trajectory_point(joints, seconds):
+    sec, nanosec = ros_duration(seconds)
+    return (
+        "{"
+        f"positions: [{joints[0]:.5f}, {joints[1]:.5f}, {joints[2]:.5f}, {joints[3]:.5f}], "
+        f"time_from_start: {{sec: {sec}, nanosec: {nanosec}}}"
+        "}"
+    )
+
+
+def send_arm_trajectory(points):
+    expected_seconds = max(seconds for _, seconds in points) if points else 1.0
+    run_arm_action(build_arm_trajectory_command(points), expected_seconds)
+
+
+def build_arm_trajectory_command(points):
+    body = ", ".join(trajectory_point(joints, seconds) for joints, seconds in points)
+    payload = (
+        "{trajectory: {joint_names: [joint1, joint2, joint3, joint4], points: "
+        f"[{body}]"
+        "}}"
+    )
+    return f"ros2 action send_goal /arm_controller/follow_joint_trajectory control_msgs/action/FollowJointTrajectory '{payload}'"
+
+
+def send_arm_trajectory_async(points):
+    return run_async(build_arm_trajectory_command(points))
+
+
+def send_gripper(position, effort=25.0):
+    payload = f"{{command: {{position: {position:.5f}, max_effort: {effort:.1f}}}}}"
+    run(f"ros2 action send_goal /gripper_controller/gripper_cmd control_msgs/action/GripperCommand '{payload}'")
+
+
+def send_gripper_checked(position, effort=25.0):
+    payload = f"{{command: {{position: {position:.5f}, max_effort: {effort:.1f}}}}}"
+    output = run_capture(
+        f"ros2 action send_goal /gripper_controller/gripper_cmd control_msgs/action/GripperCommand '{payload}'"
+    )
+    print(output, end="")
+    return parse_gripper_action_result(output)
+
+
+def send_gripper_async(position, effort=25.0, delay=0.0):
+    payload = f"{{command: {{position: {position:.5f}, max_effort: {effort:.1f}}}}}"
+    prefix = f"sleep {delay:.3f}; " if delay > 0 else ""
+    return run_async(
+        prefix
+        + f"ros2 action send_goal /gripper_controller/gripper_cmd control_msgs/action/GripperCommand '{payload}'"
+    )
+
+
+def ensure_gripper_open(retries=OPEN_RETRIES):
+    last_summary = None
+    for attempt in range(1, retries + 1):
+        if attempt > 1:
+            print(f"Open check retry {attempt}/{retries}: gripper is not fully open yet")
+            send_gripper_checked(OPEN_GRIPPER_POSITION, OPEN_GRIPPER_EFFORT)
+        time.sleep(0.2)
+        last_summary = gripper_joint_summary()
+        position = last_summary.get("position")
+        effort = last_summary.get("effort")
+        print(
+            "Open check: "
+            f"joint_position={fmt(position)} joint_effort={fmt(effort)} "
+            f"min_open={OPEN_MIN_JOINT_POSITION:.5f}"
+        )
+        if position is not None and position >= OPEN_MIN_JOINT_POSITION:
+            return last_summary
+    raise RuntimeError(
+        "gripper did not reach the open position; aborting before descent "
+        f"(last_joint_position={fmt(last_summary.get('position') if last_summary else None)})"
+    )
+
+
+def parse_gripper_action_result(output):
+    result = {}
+    for key in ("position", "effort"):
+        matches = re.findall(rf"^\s*{key}:\s*([-+0-9.eE]+)", output, re.MULTILINE)
+        if matches:
+            result[key] = float(matches[-1])
+    for key in ("stalled", "reached_goal"):
+        matches = re.findall(rf"^\s*{key}:\s*(true|false)", output, re.MULTILINE | re.IGNORECASE)
+        if matches:
+            result[key] = matches[-1].lower() == "true"
+    return result
+
+
+def parse_yaml_list(text, key):
+    match = re.search(rf"^{key}:\s*\[(.*?)\]\s*$", text, re.MULTILINE | re.DOTALL)
+    if match:
+        return [item.strip().strip("'\"") for item in match.group(1).split(",") if item.strip()]
+
+    match = re.search(rf"^{key}:\s*\n((?:- .*\n?)+)", text, re.MULTILINE)
+    if not match:
+        return []
+    values = []
+    for line in match.group(1).splitlines():
+        line = line.strip()
+        if line.startswith("- "):
+            values.append(line[2:].strip().strip("'\""))
+    return values
+
+
+def sample_joint_states():
+    try:
+        return sample_joint_states_rclpy()
+    except Exception as exc:
+        print(f"rclpy joint state sample failed, falling back to ros2 CLI: {exc}")
+        return sample_joint_states_cli()
+
+
+def sample_joint_states_rclpy(timeout_sec=0.8):
+    import rclpy
+    from sensor_msgs.msg import JointState
+
+    if not rclpy.ok():
+        rclpy.init(args=None)
+    node = rclpy.create_node("omx_fast_grip_check")
+    message = {"value": None}
+
+    def callback(msg):
+        message["value"] = msg
+
+    subscription = node.create_subscription(JointState, "/joint_states", callback, 10)
+    end = time.monotonic() + timeout_sec
+    try:
+        while message["value"] is None and time.monotonic() < end:
+            rclpy.spin_once(node, timeout_sec=0.05)
+        msg = message["value"]
+        if msg is None:
+            raise RuntimeError("timed out waiting for /joint_states")
+        return {
+            name: {
+                "position": msg.position[idx] if idx < len(msg.position) else None,
+                "effort": msg.effort[idx] if idx < len(msg.effort) else None,
+            }
+            for idx, name in enumerate(msg.name)
+        }
+    finally:
+        node.destroy_subscription(subscription)
+        node.destroy_node()
+
+
+def sample_joint_states_cli():
+    output = run_capture("ros2 topic echo --once /joint_states")
+    names = parse_yaml_list(output, "name")
+    positions = [float(v) for v in parse_yaml_list(output, "position")]
+    efforts = [float(v) for v in parse_yaml_list(output, "effort")]
+    joints = {}
+    for idx, name in enumerate(names):
+        joints[name] = {
+            "position": positions[idx] if idx < len(positions) else None,
+            "effort": efforts[idx] if idx < len(efforts) else None,
+        }
+    return joints
+
+
+def gripper_joint_summary():
+    joints = sample_joint_states()
+    left = joints.get("gripper_left_joint", {})
+    right = joints.get("gripper_right_joint", {})
+    positions = [v for v in (left.get("position"), right.get("position")) if v is not None]
+    efforts = [abs(v) for v in (left.get("effort"), right.get("effort")) if v is not None]
+    position = sum(positions) / len(positions) if positions else None
+    effort = sum(efforts) / len(efforts) if efforts else None
+    return {
+        "left": left,
+        "right": right,
+        "position": position,
+        "effort": effort,
+    }
+
+
+def verify_grasp(close_result):
+    metrics = collect_grip_metrics(close_result)
+    ok = fast_grip_gate(metrics)
+
+    print(
+        "Grip check: "
+        f"action_position={fmt(metrics['action_position'])} action_effort={fmt(metrics['action_effort'])} "
+        f"stalled={metrics['action_stalled']} reached_goal={metrics['action_reached']} "
+        f"joint_position={fmt(metrics['joint_position'])} joint_effort={fmt(metrics['joint_effort'])} "
+        f"gap={fmt(metrics['contact_gap_value'])} fast_score={metrics['fast_score']:.3f} "
+        f"gap_contact={metrics['has_contact_gap']} torque_contact={metrics['has_torque']}"
+    )
+    if not ok:
+        print("Grip check failed: object was not confidently pinched, so lift is skipped.")
+    return ok, metrics
+
+
+def regulate_gripper_pressure(metrics, duration=0.9):
+    position = metrics.get("joint_position")
+    if position is None:
+        print("Pressure regulate: skipped because gripper joint position is unavailable.")
+        return None
+
+    hold_position = max(CLOSED_GRIPPER_POSITION, min(OPEN_GRIPPER_POSITION, position))
+    samples = []
+    deadline = time.monotonic() + duration
+    while time.monotonic() < deadline:
+        joint = gripper_joint_summary()
+        position = joint.get("position")
+        effort = joint.get("effort")
+        samples.append({"position": position, "effort": effort})
+        if position is None or effort is None:
+            time.sleep(0.08)
+            continue
+
+        if effort > GRIPPER_PRESSURE_LIMIT:
+            step = GRIPPER_RELEASE_STEP * max(1.0, min(4.0, (effort - GRIPPER_PRESSURE_LIMIT) / 90.0))
+            hold_position = position + step
+        elif effort > GRIPPER_PRESSURE_TARGET + GRIPPER_PRESSURE_BAND:
+            hold_position += GRIPPER_RELEASE_STEP
+        elif effort < GRIPPER_PRESSURE_TARGET - GRIPPER_PRESSURE_BAND:
+            hold_position -= GRIPPER_TIGHTEN_STEP
+
+        hold_position = max(CLOSED_GRIPPER_POSITION, min(OPEN_GRIPPER_POSITION, hold_position))
+        send_gripper(hold_position, GRIPPER_HOLD_EFFORT)
+        print(
+            "Pressure regulate: "
+            f"joint_effort={fmt(effort)} hold_position={hold_position:.5f} "
+            f"target={GRIPPER_PRESSURE_TARGET:.0f} limit={GRIPPER_PRESSURE_LIMIT:.0f}"
+        )
+        time.sleep(0.12)
+    return {
+        "hold_position": hold_position,
+        "hold_effort": GRIPPER_HOLD_EFFORT,
+        "samples": samples[-8:],
+    }
+
+
+def collect_grip_metrics(close_result):
+    joint_summary = gripper_joint_summary()
+    action_position = close_result.get("position")
+    action_effort = close_result.get("effort")
+    action_stalled = close_result.get("stalled")
+    action_reached = close_result.get("reached_goal")
+    measured_position = joint_summary.get("position")
+    measured_effort = joint_summary.get("effort")
+
+    contact_positions = [v for v in (action_position, measured_position) if v is not None]
+    contact_position = max(contact_positions) if contact_positions else 0.0
+    has_contact_gap = contact_position > FAST_GATE_MIN_GAP
+    has_torque = measured_effort is not None and measured_effort >= FAST_GATE_MIN_EFFORT
+    action_contact = bool(action_stalled) or action_reached is False
+    # Some Gazebo controllers report the requested max effort in the action
+    # result, so prefer /joint_states effort when available and use action
+    # effort only as a weak fallback.
+    weak_effort_contact = measured_effort is None and action_effort is not None and action_effort >= 20.0
+    effort_score = min((measured_effort or 0.0) / FAST_GATE_MIN_EFFORT, 1.0)
+    gap_score = min(contact_position / FAST_GATE_MIN_GAP, 1.0)
+    fast_score = 0.5 * effort_score + 0.5 * gap_score
+
+    return {
+        "action_position": action_position,
+        "action_effort": action_effort,
+        "action_stalled": action_stalled,
+        "action_reached": action_reached,
+        "joint_position": measured_position,
+        "joint_effort": measured_effort,
+        "contact_gap_value": contact_position,
+        "has_contact_gap": has_contact_gap,
+        "has_torque": has_torque,
+        "action_contact": action_contact,
+        "weak_effort_contact": weak_effort_contact,
+        "fast_score": fast_score,
+    }
+
+
+def fast_grip_gate(metrics):
+    return bool(
+        metrics["has_contact_gap"]
+        and (metrics["has_torque"] or metrics["action_contact"] or metrics["weak_effort_contact"])
+    )
+
+
+def parse_pose_blocks(text):
+    blocks = []
+    current = []
+    depth = 0
+    in_pose = False
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped == "pose {":
+            in_pose = True
+            current = [line]
+            depth = 1
+            continue
+        if not in_pose:
+            continue
+        current.append(line)
+        depth += line.count("{") - line.count("}")
+        if depth == 0:
+            blocks.append("\n".join(current))
+            in_pose = False
+    return blocks
+
+
+def gz_pose(name):
+    output = run_capture_optional("timeout 2 gz topic -e -t /world/omx_grasp_lab/pose/info")
+    for block in parse_pose_blocks(output):
+        if f'name: "{name}"' not in block:
+            continue
+        values = {}
+        section = None
+        for line in block.splitlines():
+            stripped = line.strip()
+            if stripped == "position {":
+                section = "position"
+                continue
+            if stripped == "orientation {":
+                section = "orientation"
+                continue
+            if stripped == "}":
+                section = None
+                continue
+            match = re.match(r"([xyzw]):\s*([-+0-9.eE]+)", stripped)
+            if match and section == "position":
+                values[match.group(1)] = float(match.group(2))
+        return (values.get("x", 0.0), values.get("y", 0.0), values.get("z", 0.0))
+    return None
+
+
+def truth_lift_label(target):
+    samples = []
+    deadline = time.monotonic() + 1.0
+    while time.monotonic() < deadline:
+        pose = gz_pose("grasp_cube")
+        if pose is not None:
+            dx = pose[0] - target["x"]
+            dy = pose[1] - target["y"]
+            samples.append(
+                {
+                    "x": pose[0],
+                    "y": pose[1],
+                    "z": pose[2],
+                    "xy_error": math.hypot(dx, dy),
+                }
+            )
+        time.sleep(0.15)
+
+    if not samples:
+        return {"available": False, "success": False, "samples": 0}
+
+    min_z = min(s["z"] for s in samples)
+    max_xy = max(s["xy_error"] for s in samples)
+    success = min_z >= TRUTH_MIN_LIFT_Z and max_xy <= TRUTH_MAX_XY_ERROR
+    return {
+        "available": True,
+        "success": success,
+        "samples": len(samples),
+        "min_z": min_z,
+        "max_xy_error": max_xy,
+    }
+
+
+def fmt(value):
+    if value is None:
+        return "n/a"
+    return f"{value:.5f}"
+
+
+def main():
+    dry_run = "--dry-run" in sys.argv
+    truth_label = "--truth-label" in sys.argv
+    no_gate = "--no-gate" in sys.argv
+    write_json = "--json-result" in sys.argv
+    hold_seconds = 3.0
+    profile_name = "max"
+    sequential = "--sequential" in sys.argv
+    if "--hold" in sys.argv:
+        idx = sys.argv.index("--hold")
+        if idx + 1 >= len(sys.argv):
+            raise SystemExit("--hold requires seconds")
+        hold_seconds = float(sys.argv[idx + 1])
+    if "--profile" in sys.argv:
+        idx = sys.argv.index("--profile")
+        if idx + 1 >= len(sys.argv):
+            raise SystemExit("--profile requires one of: safe, fast, turbo, max")
+        profile_name = sys.argv[idx + 1]
+    if write_json:
+        idx = sys.argv.index("--json-result")
+        if idx + 1 >= len(sys.argv):
+            raise SystemExit("--json-result requires path")
+        result_path = Path(sys.argv[idx + 1]).expanduser()
+    else:
+        result_path = RESULT_FILE
+    if profile_name not in PROFILES:
+        raise SystemExit(f"Unknown profile {profile_name!r}; choose safe, fast, turbo, or max")
+    profile = PROFILES[profile_name]
+    if not TARGET_FILE.exists():
+        raise SystemExit("No random target found. Start Gazebo with omx-random-grasp-gz first.")
+
+    target = json.loads(TARGET_FILE.read_text())
+    x, y = target["x"], target["y"]
+    radial = math.hypot(x, y)
+    q1 = math.atan2(y, x)
+    push_start_radial = radial + TCP_PUSH_START_OFFSET
+    ik_radial = radial + TCP_CENTER_FORWARD_OFFSET
+
+    # Staged approach: come down a little short of the object center, then push
+    # forward at grasp height so the gripper center settles onto the object.
+    approach = [q1] + solve_planar(push_start_radial, APPROACH_Z, pitch=-0.05)
+    push_start = [q1] + solve_planar(push_start_radial, GRASP_Z, pitch=0.0)
+    grasp = [q1] + solve_planar(ik_radial, GRASP_Z, pitch=0.0)
+    lift = [q1] + solve_planar(ik_radial, LIFT_Z, pitch=0.0)
+
+    print(f"Target: x={x:.3f}, y={y:.3f}, radial={radial:.3f}, yaw joint={q1:.3f}")
+    print(f"Push-in path: lower at radial={push_start_radial:.3f}, push to radial={ik_radial:.3f}")
+    print(f"Heights: approach z={APPROACH_Z:.3f}, grasp z={GRASP_Z:.3f}, lift z={LIFT_Z:.3f}")
+    print(
+        "Speed profile: "
+        f"{profile_name} "
+        f"approach={profile['approach']:.1f}s descend={profile['descend']:.1f}s "
+        f"push={profile['push']:.1f}s lift={profile['lift']:.1f}s"
+        + (" sequential" if sequential else " pipelined")
+    )
+    print(f"Approach joints: {[round(v, 3) for v in approach]}")
+    print(f"Push start joints:{[round(v, 3) for v in push_start]}")
+    print(f"Grasp joints:    {[round(v, 3) for v in grasp]}")
+    print(f"Lift joints:     {[round(v, 3) for v in lift]}")
+
+    if dry_run:
+        print("dry run complete")
+        return
+
+    if not sequential:
+        t_approach = profile["approach"]
+        t_grasp = profile["descend"] + profile["push"]
+
+        print("[1/6] open gripper while moving above object")
+        started_at = time.monotonic()
+        open_proc = send_gripper_async(OPEN_GRIPPER_POSITION, OPEN_GRIPPER_EFFORT)
+
+        print("[2/6] move above object only; do not descend until gripper is open")
+        arm_proc = send_arm_trajectory_async([(approach, t_approach)])
+
+        print("[3/6] confirm gripper open and arm above object")
+        if open_proc.wait() != 0:
+            raise subprocess.CalledProcessError(open_proc.returncode, "open gripper async command")
+        if arm_proc.wait() != 0:
+            raise subprocess.CalledProcessError(arm_proc.returncode, "approach trajectory")
+        ensure_gripper_open()
+
+        print("[4/6] descend and push into grasp pose with gripper already open")
+        send_arm_trajectory(
+            [
+                (push_start, profile["descend"]),
+                (grasp, t_grasp),
+            ]
+        )
+
+        print("[5/6] close gripper, then verify fast torque/contact gate")
+        close_result = send_gripper_checked(CLOSED_GRIPPER_POSITION, CLOSED_GRIPPER_EFFORT)
+        time.sleep(profile.get("close_settle", 0.25))
+        gate_ok, metrics = verify_grasp(close_result)
+        if not gate_ok and not no_gate:
+            raise SystemExit(2)
+        pressure_result = regulate_gripper_pressure(metrics)
+
+        print("[6/6] lift object after fast gate")
+        send_arm(lift, profile["lift"])
+        truth = truth_lift_label(target) if truth_label else None
+        if truth is not None:
+            print(
+                "Truth label: "
+                f"success={truth['success']} samples={truth.get('samples', 0)} "
+                f"min_z={fmt(truth.get('min_z'))} max_xy_error={fmt(truth.get('max_xy_error'))}"
+            )
+        time.sleep(hold_seconds)
+        result = {
+            "target": target,
+            "profile": profile_name,
+            "fast_gate_ok": gate_ok,
+            "metrics": metrics,
+            "pressure_result": pressure_result,
+            "truth": truth,
+            "motion_wall_time": time.monotonic() - started_at,
+        }
+        result_path.parent.mkdir(parents=True, exist_ok=True)
+        result_path.write_text(json.dumps(result, indent=2) + "\n")
+        print(f"done; motion wall time: {time.monotonic() - started_at:.1f}s")
+        return
+
+    print("[1/7] open gripper")
+    send_gripper(OPEN_GRIPPER_POSITION, OPEN_GRIPPER_EFFORT)
+    ensure_gripper_open()
+
+    print("[2/7] move above object")
+    send_arm(approach, profile["approach"])
+
+    print("[3/7] descend slightly short of object center")
+    send_arm(push_start, profile["descend"])
+
+    print("[4/7] push forward into grasp pose")
+    send_arm(grasp, profile["push"])
+
+    print("[5/7] close gripper")
+    close_result = send_gripper_checked(CLOSED_GRIPPER_POSITION, CLOSED_GRIPPER_EFFORT)
+    time.sleep(profile.get("close_settle", 0.25))
+    gate_ok, metrics = verify_grasp(close_result)
+    if not gate_ok and not no_gate:
+        raise SystemExit(2)
+    pressure_result = regulate_gripper_pressure(metrics)
+
+    print("[6/7] lift object")
+    send_arm(lift, profile["lift"])
+    truth = truth_lift_label(target) if truth_label else None
+    if truth is not None:
+        print(
+            "Truth label: "
+            f"success={truth['success']} samples={truth.get('samples', 0)} "
+            f"min_z={fmt(truth.get('min_z'))} max_xy_error={fmt(truth.get('max_xy_error'))}"
+        )
+    result = {
+        "target": target,
+        "profile": profile_name,
+        "fast_gate_ok": gate_ok,
+        "metrics": metrics,
+        "pressure_result": pressure_result,
+        "truth": truth,
+    }
+    result_path.parent.mkdir(parents=True, exist_ok=True)
+    result_path.write_text(json.dumps(result, indent=2) + "\n")
+
+    print(f"[7/7] hold for {hold_seconds:.1f}s")
+    time.sleep(hold_seconds)
+    print("done")
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except subprocess.CalledProcessError as exc:
+        raise SystemExit(exc.returncode)
