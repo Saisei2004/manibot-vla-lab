@@ -8,9 +8,9 @@ OpenMANIPULATOR X、TurtleBot3、Gazebo、ROS 2 Jazzy、iPhone テレオペを�
 
 ![TurtleBot3 Burger Nav2 demo](docs/media/nav2-burger-demo.png)
 
-<video src="docs/media/open-manipulator-grasp-demo.mov" controls width="100%">
-  OpenMANIPULATOR X grasp demo
-</video>
+[![OpenMANIPULATOR X grasp demo](docs/media/open-manipulator-grasp-demo-preview.gif)](docs/media/open-manipulator-grasp-demo.mov)
+
+Full video: [OpenMANIPULATOR X grasp demo](docs/media/open-manipulator-grasp-demo.mov)
 
 ## Research Direction
 
