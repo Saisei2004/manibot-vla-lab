@@ -74,8 +74,12 @@ Full video: [OpenMANIPULATOR X grasp demo](docs/media/open-manipulator-grasp-dem
 │   ├── omx_grasp_lab.sdf
 │   ├── worlds/
 │   └── ros2_ws/
+├── scripts/
+│   └── install_vm_files.sh
 ├── vm_launchers/
 ├── docs/media/
+├── docs/environment.md
+├── docs/project-manifest.md
 └── ubuntu-24.04-vm-setup.md
 ```
 
@@ -147,6 +151,17 @@ python3 iphone_gazebo_bridge/iphone_gazebo_bridge.py
 
 Xcode で `iphone_gazebo_teleop/iPhoneGazeboTeleop.xcodeproj` を開き、iPhone 実機へ Run します。  
 アプリにはブリッジが表示する Mac IP と port `8765` を入力します。
+
+Fresh VM restore:
+
+```bash
+git clone https://github.com/Saisei2004/manibot-vla-lab.git
+cd manibot-vla-lab
+bash scripts/install_vm_files.sh
+```
+
+Environment details are in [`docs/environment.md`](docs/environment.md).
+The full repository snapshot is summarized in [`docs/project-manifest.md`](docs/project-manifest.md).
 
 ## Useful VM Commands
 
